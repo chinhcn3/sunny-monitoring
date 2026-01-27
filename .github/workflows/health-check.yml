@@ -122,6 +122,15 @@ jobs:
               echo "Response:"
               if command -v jq &> /dev/null; then
                 cat /tmp/health_response.json | jq '.' 2>/dev/null || cat /tmp/health_response.json | head -50
+                # Trích xuất thông tin từ response
+                COMMIT_HASH=$(cat /tmp/health_response.json | jq -r '.data.info.commitHash // .data.details.commitHash // "N/A"' 2>/dev/null)
+                BUILD_DATE=$(cat /tmp/health_response.json | jq -r '.data.info.buildDate // .data.details.buildDate // "N/A"' 2>/dev/null)
+                if [ "$COMMIT_HASH" != "N/A" ] || [ "$BUILD_DATE" != "N/A" ]; then
+                  echo ""
+                  echo "📦 Thông tin build:"
+                  echo "   Commit: ${COMMIT_HASH}"
+                  echo "   Build Date: ${BUILD_DATE}"
+                fi
               else
                 cat /tmp/health_response.json | head -50
               fi
@@ -129,26 +138,72 @@ jobs:
               
               # Gửi thông báo Telegram khi thành công
               if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
+                echo "📱 Đang gửi thông báo Telegram..."
                 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
                 WORKFLOW_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+                
+                # Trích xuất thông tin từ response để thêm vào message
+                if command -v jq &> /dev/null && [ -f /tmp/health_response.json ]; then
+                  COMMIT_HASH=$(cat /tmp/health_response.json | jq -r '.data.info.commitHash // .data.details.commitHash // ""' 2>/dev/null)
+                  BUILD_DATE=$(cat /tmp/health_response.json | jq -r '.data.info.buildDate // .data.details.buildDate // ""' 2>/dev/null)
+                else
+                  COMMIT_HASH=""
+                  BUILD_DATE=""
+                fi
                 
                 MESSAGE="✅ Health Check Thành Công%0A%0A"
                 MESSAGE="${MESSAGE}🕐 Thời gian: ${TIMESTAMP}%0A"
                 MESSAGE="${MESSAGE}🌐 API: ${API_URL}%0A"
                 MESSAGE="${MESSAGE}📊 Status: HTTP ${HTTP_CODE}%0A"
+                if [ -n "$COMMIT_HASH" ]; then
+                  MESSAGE="${MESSAGE}📦 Commit: ${COMMIT_HASH}%0A"
+                fi
+                if [ -n "$BUILD_DATE" ]; then
+                  MESSAGE="${MESSAGE}🏗️  Build: ${BUILD_DATE}%0A"
+                fi
                 MESSAGE="${MESSAGE}🔄 Lần thử: $((RETRY_COUNT + 1))/${MAX_RETRIES}%0A"
                 MESSAGE="${MESSAGE}🔗 Workflow: ${WORKFLOW_URL}"
                 
                 TELEGRAM_URL="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=${TELEGRAM_CHAT_ID}&text=${MESSAGE}"
                 
-                TELEGRAM_RESPONSE=$(curl -s -w "\n%{http_code}" "$TELEGRAM_URL" || echo "000")
-                TELEGRAM_HTTP_CODE=$(echo "$TELEGRAM_RESPONSE" | tail -n1)
+                # Gửi Telegram với retry logic
+                TELEGRAM_RETRY=0
+                TELEGRAM_MAX_RETRY=3
+                TELEGRAM_SUCCESS=false
                 
-                if [ "$TELEGRAM_HTTP_CODE" -eq 200 ]; then
-                  echo "📱 Đã gửi thông báo Telegram thành công!"
-                else
-                  echo "⚠️  Không thể gửi thông báo Telegram (HTTP $TELEGRAM_HTTP_CODE)"
+                while [ $TELEGRAM_RETRY -lt $TELEGRAM_MAX_RETRY ]; do
+                  TELEGRAM_RETRY=$((TELEGRAM_RETRY + 1))
+                  echo "  🔄 Gửi Telegram lần $TELEGRAM_RETRY/$TELEGRAM_MAX_RETRY..."
+                  
+                  # Sử dụng curl với timeout và lưu response vào file tạm
+                  TELEGRAM_HTTP_CODE=$(curl -s -o /tmp/telegram_response.json -w "%{http_code}" \
+                    --max-time 10 \
+                    --connect-timeout 5 \
+                    "$TELEGRAM_URL" 2>/dev/null || echo "000")
+                  
+                  if [ "$TELEGRAM_HTTP_CODE" -eq 200 ]; then
+                    echo "📱 Đã gửi thông báo Telegram thành công!"
+                    TELEGRAM_SUCCESS=true
+                    break
+                  else
+                    echo "  ⚠️  Lỗi gửi Telegram (HTTP $TELEGRAM_HTTP_CODE)"
+                    if [ -f /tmp/telegram_response.json ]; then
+                      echo "  Response: $(cat /tmp/telegram_response.json | head -100)"
+                    fi
+                    if [ $TELEGRAM_RETRY -lt $TELEGRAM_MAX_RETRY ]; then
+                      echo "  ⏳ Đợi 2 giây trước khi thử lại..."
+                      sleep 2
+                    fi
+                  fi
+                done
+                
+                if [ "$TELEGRAM_SUCCESS" = false ]; then
+                  echo "⚠️  Không thể gửi thông báo Telegram sau $TELEGRAM_MAX_RETRY lần thử"
+                  echo "   Kiểm tra lại TELEGRAM_BOT_TOKEN và TELEGRAM_CHAT_ID"
                 fi
+                
+                # Cleanup
+                rm -f /tmp/telegram_response.json 2>/dev/null || true
               else
                 echo "ℹ️  Telegram bot token hoặc chat_id chưa được cấu hình, bỏ qua gửi thông báo"
               fi
@@ -173,6 +228,7 @@ jobs:
             
             # Gửi thông báo Telegram khi thất bại
             if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
+              echo "📱 Đang gửi thông báo Telegram (thất bại)..."
               TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
               WORKFLOW_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
               
@@ -183,7 +239,25 @@ jobs:
               MESSAGE="${MESSAGE}🔗 Workflow: ${WORKFLOW_URL}%0A"
               
               TELEGRAM_URL="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage?chat_id=${TELEGRAM_CHAT_ID}&text=${MESSAGE}"
-              curl -s "$TELEGRAM_URL" > /dev/null || true
+              
+              # Gửi với retry
+              TELEGRAM_RETRY=0
+              while [ $TELEGRAM_RETRY -lt 3 ]; do
+                TELEGRAM_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                  --max-time 10 \
+                  --connect-timeout 5 \
+                  "$TELEGRAM_URL" 2>/dev/null || echo "000")
+                
+                if [ "$TELEGRAM_HTTP_CODE" -eq 200 ]; then
+                  echo "📱 Đã gửi thông báo Telegram thành công!"
+                  break
+                else
+                  TELEGRAM_RETRY=$((TELEGRAM_RETRY + 1))
+                  if [ $TELEGRAM_RETRY -lt 3 ]; then
+                    sleep 2
+                  fi
+                fi
+              done
             fi
             
             exit 1
