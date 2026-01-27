@@ -1,101 +1,221 @@
+# GitHub Actions Workflow cho Health Check
+# 
+# Để chạy health check mỗi 10 phút, workflow này sử dụng schedule trigger
+# Cron patterns phổ biến:
+# - Mỗi 10 phút: */10 * * * *
+# - Mỗi 15 phút: */15 * * * *
+# - Mỗi giờ: 0 * * * *
+# - Mỗi 6 giờ: 0 */6 * * *
+#
+# Cấu hình biến trong GitHub:
+# Settings > Secrets and variables > Actions > Variables:
+#   - HEALTH_CHECK_API_URL: https://tdffm.com
+#   - TELEGRAM_BOT_TOKEN: (nếu muốn nhận thông báo)
+#   - TELEGRAM_CHAT_ID: (nếu muốn nhận thông báo)
+
 name: Health Check
 
 on:
+  # Chạy theo lịch (mỗi 10 phút)
   schedule:
     - cron: '*/10 * * * *'
+  
+  # Chạy thủ công từ GitHub UI
   workflow_dispatch:
     inputs:
       api_url:
-        description: 'API URL for health check'
+        description: 'API URL để health check'
         required: false
         type: string
+  
+  # Chạy khi push code
+  push:
+    branches:
+      - main
+      - master
+  
+  # Chạy khi có pull request
+  pull_request:
+    branches:
+      - main
+      - master
 
 env:
+  # Các biến mặc định - có thể override bằng GitHub Secrets/Variables
   HEALTH_CHECK_TIMEOUT: 30
   HEALTH_CHECK_RETRIES: 3
 
 jobs:
   health-check:
+    name: Health Check API
     runs-on: ubuntu-latest
     timeout-minutes: 2
-
+    
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Health check API
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup job info
+        id: job-info
+        run: |
+          echo "=========================================="
+          echo "🚀 HEALTH CHECK JOB ĐÃ ĐƯỢC GỌI!"
+          echo "=========================================="
+          echo "📋 Workflow: ${GITHUB_WORKFLOW}"
+          echo "🌿 Branch: ${GITHUB_REF_NAME}"
+          echo "🆔 Run ID: ${GITHUB_RUN_ID}"
+          echo "🕐 Thời gian: $(date)"
+          echo "=========================================="
+      
+      - name: Health Check API
+        id: health-check
         env:
           API_URL: ${{ github.event.inputs.api_url || vars.HEALTH_CHECK_API_URL || secrets.HEALTH_CHECK_API_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          if [ -z "$API_URL" ]; then
-            echo "ERROR: HEALTH_CHECK_API_URL not set"
+          echo "🔍 Bắt đầu health check cho API..."
+          
+          # Kiểm tra xem API_URL đã được set chưa
+          if [ -z "${API_URL}" ]; then
+            echo "❌ Lỗi: HEALTH_CHECK_API_URL chưa được cấu hình!"
+            echo "Vui lòng thêm biến HEALTH_CHECK_API_URL trong GitHub Secrets/Variables"
+            echo "Hoặc truyền qua workflow_dispatch input"
             exit 1
           fi
-
-          ENDPOINT="${API_URL}/api/v1/health"
-          MAX_RETRIES=${HEALTH_CHECK_RETRIES}
-          TIMEOUT=${HEALTH_CHECK_TIMEOUT}
-
-          echo "Starting health check for: $ENDPOINT"
-          echo "Max retries: $MAX_RETRIES, Timeout: ${TIMEOUT}s"
-
-          RETRY=0
+          
+          HEALTH_CHECK_ENDPOINT="${API_URL}/api/v1/health"
+          echo "🌐 API URL: ${API_URL}"
+          echo "🔗 Health Check Endpoint: ${HEALTH_CHECK_ENDPOINT}"
+          
+          # Debug: Kiểm tra các biến Telegram (không hiển thị giá trị để bảo mật)
+          if [ -n "${TELEGRAM_BOT_TOKEN}" ]; then
+            echo "✅ TELEGRAM_BOT_TOKEN: đã được cấu hình"
+          else
+            echo "ℹ️  TELEGRAM_BOT_TOKEN: chưa được cấu hình (sẽ không gửi thông báo Telegram)"
+          fi
+          
+          if [ -n "${TELEGRAM_CHAT_ID}" ]; then
+            echo "✅ TELEGRAM_CHAT_ID: đã được cấu hình"
+          else
+            echo "ℹ️  TELEGRAM_CHAT_ID: chưa được cấu hình (sẽ không gửi thông báo Telegram)"
+          fi
+          
+          # Thực hiện health check với retry logic
+          MAX_RETRIES=${HEALTH_CHECK_RETRIES:-3}
+          RETRY_COUNT=0
           SUCCESS=false
-
-          while [ $RETRY -lt $MAX_RETRIES ]; do
-            echo "Attempt $((RETRY + 1))/$MAX_RETRIES..."
+          HTTP_CODE="000"
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "🔄 Lần thử: $((RETRY_COUNT + 1))/$MAX_RETRIES"
             
-            HTTP_CODE=$(curl -s -o response.json -w "%{http_code}" \
-              --max-time $TIMEOUT \
+            # Thực hiện curl request
+            HTTP_CODE=$(curl -s -o /tmp/health_response.json -w "%{http_code}" \
+              --max-time ${HEALTH_CHECK_TIMEOUT:-30} \
               --connect-timeout 10 \
-              "$ENDPOINT" || echo "000")
-
-            echo "HTTP Status: $HTTP_CODE"
-
-            if [ "$HTTP_CODE" = "200" ]; then
+              -H "Accept: application/json" \
+              "${HEALTH_CHECK_ENDPOINT}" || echo "000")
+            
+            if [ "$HTTP_CODE" -eq 200 ]; then
+              echo "✅ Health check thành công!"
+              echo "Response:"
+              if command -v jq &> /dev/null; then
+                cat /tmp/health_response.json | jq '.' 2>/dev/null || cat /tmp/health_response.json | head -50
+                # Trích xuất thông tin từ response
+                COMMIT_HASH=$(cat /tmp/health_response.json | jq -r '.data.info.commitHash // .data.details.commitHash // "N/A"' 2>/dev/null)
+                BUILD_DATE=$(cat /tmp/health_response.json | jq -r '.data.info.buildDate // .data.details.buildDate // "N/A"' 2>/dev/null)
+                if [ "$COMMIT_HASH" != "N/A" ] || [ "$BUILD_DATE" != "N/A" ]; then
+                  echo ""
+                  echo "📦 Thông tin build:"
+                  echo "   Commit: ${COMMIT_HASH}"
+                  echo "   Build Date: ${BUILD_DATE}"
+                fi
+              else
+                cat /tmp/health_response.json | head -50
+              fi
               SUCCESS=true
-              echo "Health check successful!"
+              
+              # Gửi thông báo Telegram khi thành công
+              if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
+                echo "📱 Đang gửi thông báo Telegram..."
+                
+                MESSAGE="Health Check Thanh Cong
+API: ${API_URL}
+Time: $(date -u)"
+                
+                # Gửi Telegram với POST và --data-urlencode (tự động encode)
+                TELEGRAM_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+                  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                  --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+                  --data-urlencode "text=${MESSAGE}" \
+                  --max-time 10 \
+                  --connect-timeout 5)
+                
+                TELEGRAM_HTTP_CODE=$(echo "$TELEGRAM_RESPONSE" | tail -n1)
+                if [ "$TELEGRAM_HTTP_CODE" = "200" ]; then
+                  echo "📱 Đã gửi thông báo Telegram thành công!"
+                else
+                  echo "⚠️  Không thể gửi thông báo Telegram (HTTP $TELEGRAM_HTTP_CODE)"
+                fi
+              else
+                echo "ℹ️  Telegram bot token hoặc chat_id chưa được cấu hình, bỏ qua gửi thông báo"
+              fi
+              
               break
-            fi
-
-            RETRY=$((RETRY + 1))
-            if [ $RETRY -lt $MAX_RETRIES ]; then
-              echo "Waiting 5 seconds before retry..."
-              sleep 5
+            else
+              echo "⚠️  Health check thất bại với HTTP code: $HTTP_CODE"
+              if [ -f /tmp/health_response.json ]; then
+                echo "Response:"
+                cat /tmp/health_response.json
+              fi
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "⏳ Đợi 5 giây trước khi thử lại..."
+                sleep 5
+              fi
             fi
           done
-
-          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-            if [ "$SUCCESS" != "true" ]; then
-              MESSAGE="Health check FAILED
-API: $API_URL
+          
+          if [ "$SUCCESS" = false ]; then
+            echo "❌ Health check thất bại sau $MAX_RETRIES lần thử!"
+            
+            # Gửi thông báo Telegram khi thất bại
+            if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
+              echo "📱 Đang gửi thông báo Telegram (thất bại)..."
+              
+              MESSAGE="Health Check That Bai
+API: ${API_URL}
 Time: $(date -u)"
-            else
-              MESSAGE="Health check OK
-API: $API_URL
-Time: $(date -u)"
+              
+              # Gửi Telegram với POST và --data-urlencode (tự động encode)
+              TELEGRAM_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+                "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+                --data-urlencode "text=${MESSAGE}" \
+                --max-time 10 \
+                --connect-timeout 5)
+              
+              TELEGRAM_HTTP_CODE=$(echo "$TELEGRAM_RESPONSE" | tail -n1)
+              if [ "$TELEGRAM_HTTP_CODE" = "200" ]; then
+                echo "📱 Đã gửi thông báo Telegram thành công!"
+              else
+                echo "⚠️  Không thể gửi thông báo Telegram (HTTP $TELEGRAM_HTTP_CODE)"
+              fi
             fi
-
-            # Gửi Telegram với proper encoding
-            TELEGRAM_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=${MESSAGE}")
-
-            TELEGRAM_HTTP_CODE=$(echo "$TELEGRAM_RESPONSE" | tail -n1)
-            if [ "$TELEGRAM_HTTP_CODE" = "200" ]; then
-              echo "Telegram notification sent successfully"
-            else
-              echo "Failed to send Telegram notification (HTTP $TELEGRAM_HTTP_CODE)"
-              echo "Response: $(echo "$TELEGRAM_RESPONSE" | head -n-1)"
-            fi
-          fi
-
-          # Cleanup
-          rm -f response.json 2>/dev/null || true
-
-          if [ "$SUCCESS" != "true" ]; then
-            echo "Health check failed after $MAX_RETRIES attempts"
+            
             exit 1
           fi
+      
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-check-response
+          path: /tmp/health_response.json
+          retention-days: 1
+      
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f /tmp/health_response.json 2>/dev/null || true
