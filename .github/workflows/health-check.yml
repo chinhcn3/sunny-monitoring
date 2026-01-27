@@ -140,9 +140,7 @@ jobs:
               if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
                 echo "📱 Đang gửi thông báo Telegram..."
                 
-                MESSAGE="Health Check Thanh Cong
-API: ${API_URL}
-Time: $(date -u)"
+                MESSAGE="Health Check Thanh Cong"$'\n'"API: ${API_URL}"$'\n'"Time: $(date -u)"
                 
                 # Gửi Telegram với POST và --data-urlencode (tự động encode)
                 TELEGRAM_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
@@ -184,9 +182,7 @@ Time: $(date -u)"
             if [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ]; then
               echo "📱 Đang gửi thông báo Telegram (thất bại)..."
               
-              MESSAGE="Health Check That Bai
-API: ${API_URL}
-Time: $(date -u)"
+              MESSAGE="Health Check That Bai"$'\n'"API: ${API_URL}"$'\n'"Time: $(date -u)"
               
               # Gửi Telegram với POST và --data-urlencode (tự động encode)
               TELEGRAM_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
